@@ -49,7 +49,7 @@ func ReadDelimitedProtoMessage(br *bufio.Reader) ([]byte, error) {
 }
 
 func loadEnvVars() map[string]interface{} {
-	want := [...]string{"CD_ENV",
+	want := [...]{string{"CD_ENV",
 		"CI_COMMIT_AUTHOR",
 		"CI_COMMIT_SHA",
 		"CI_COMMIT_TAG",
@@ -117,7 +117,7 @@ func loadEnvVars() map[string]interface{} {
 func envVarOrDie(name string) string {
 	ans := os.Getenv(name)
 	if ans == "" {
-		log.Fatalln("Could not load env var ", name)
+		log.Fatalln("Could not load required secret from environment")
 	}
 	return ans
 }
@@ -127,8 +127,9 @@ func main() {
 	debug := flag.Bool("n", false, "Debug mode: Output all the proto in text json text form")
 	flag.Parse()
 
+	honeycombToken := envVarOrDie("HONEYCOMB_API_TOKEN")
 	beeline.Init(beeline.Config{
-		WriteKey:    envVarOrDie("HONEYCOMB_API_TOKEN"),
+		WriteKey:    honeycombToken,
 		Dataset:     "bazel",
 		ServiceName: "exporter",
 	})
@@ -205,175 +206,4 @@ func ProcessTestLogFile(shouldExtractFailures bool, fileIdx int, file *build_eve
 	} else {
 		testLogStr := string(testLog)
 		kibanaUrl, err := ExtractKibanaUrlFromTestLog(testLogStr)
-		if err != nil {
-			kibanaUrl = err.Error()
-		}
-		kibanaUrlsMap["url_"+strconv.Itoa(fileIdx)] = kibanaUrl
-		if shouldExtractFailures {
-			failureMsg, err := ExtractFailuresFromTestLog(testLogStr)
-			if err != nil {
-				log.Printf("Couldn't extract failures from file=%v, err: %v\n", file, err)
-				failureMsg = err.Error()
-			}
-			failuresMap["failure_"+strconv.Itoa(fileIdx)] = failureMsg
-		}
-	}
-}
-
-func ConvertMapToString(m map[string]string, testTarget string) string {
-	result := ""
-	var buffer bytes.Buffer
-	encoder := json.NewEncoder(&buffer)
-	// Here we change the default encoding behavior, as urls can contain special symbols like &. We don't want to escape those.
-	encoder.SetEscapeHTML(false)
-	err := encoder.Encode(m)
-	if err != nil {
-		errMsg := "Processing error: Failed to json encode map"
-		log.Printf("%s for target=%s: %v\n", errMsg, testTarget, err)
-		result = errMsg
-	} else {
-		result = buffer.String()
-		// For purely visual purposes, instead of printing an empty map (i.e. {}) in Honeycomb, let's print nothing.
-		if result == "{}" {
-			result = ""
-		}
-	}
-	return result
-}
-
-func ExtractFailuresAndKibanaUrls(testTarget string, summary *build_event_stream.TestSummary) (string, string) {
-	// It is important for the script to NOT fail in case of errors/panics when processing system-test logs.
-	// Thus, this function recovers from panic, if one occurs.
-	defer HandlePanic()
-	// These could be lists instead of maps. However, in Honeycomb one can spot a particular failure message (especially verbose one) easier when an index is shown: {failure_1: "error_1", "failure_2": "error_2", ...} vs ["error_1", ... , ].
-	failureMessagesMap := make(map[string]string)
-	kibanaUrlsMap := make(map[string]string)
-	fileIdx := 1
-	for _, file := range summary.GetFailed() {
-		ProcessTestLogFile(true, fileIdx, file, failureMessagesMap, kibanaUrlsMap)
-		fileIdx += 1
-	}
-	for _, file := range summary.GetPassed() {
-		ProcessTestLogFile(false, fileIdx, file, failureMessagesMap, kibanaUrlsMap)
-		fileIdx += 1
-	}
-	kibanaUrls := ConvertMapToString(kibanaUrlsMap, testTarget)
-	failureMessages := ConvertMapToString(failureMessagesMap, testTarget)
-	return kibanaUrls, failureMessages
-}
-
-func HandlePanic() {
-	if err := recover(); err != nil {
-		log.Printf("Recovered from panic: %v\n", err)
-	}
-}
-
-func IsSystemTestTarget(testTarget string) bool {
-	return strings.Contains(testTarget, "//rs/tests/")
-}
-
-func GetTestLog(file *build_event_stream.File) ([]byte, error) {
-	// Uri has the form bytestream://bazel-remote.idx.dfinity.network/blobs/id1/id2
-	uri := file.GetUri()
-	parsedURI, err := url.Parse(uri)
-	if err != nil {
-		log.Printf("Failed to parse uri %s, error: %v\n", uri, err)
-		return []byte{}, err
-	}
-	if parsedURI.Scheme != "bytestream" {
-		err := fmt.Errorf("The expected scheme in uri is `bytestream`, actual scheme is `%v`", parsedURI.Scheme)
-		log.Println(err)
-		return []byte{}, err
-	}
-	url := parsedURI.Host
-	if parsedURI.Port() == "" {
-		url += ":443"
-	}
-	blobId := parsedURI.Path
-	dialOpts := []grpc.DialOption{
-		grpc.WithBlock(),
-		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: false})),
-	}
-	// Pass a context with a timeout to tell a blocking function that it
-	// should abandon its work after the timeout elapses.
-	ctx, cancel := context.WithTimeout(context.Background(), GRPC_DIAL_TIMEOUT)
-	defer cancel()
-	conn, err := grpc.DialContext(ctx, url, dialOpts...)
-	if err != nil {
-		log.Printf("grpc.Dial(%v, dialOpts...) failed: %v\n", url, err)
-		return []byte{}, err
-	}
-	defer conn.Close()
-	client := bytestream.NewByteStreamClient(conn)
-	ctx = context.Background()
-	bstream, err := client.Read(ctx, &bytestream.ReadRequest{
-		ResourceName: blobId,
-	})
-	if err != nil {
-		log.Printf("Failed to read bytestream: %v\n", err)
-		return []byte{}, err
-	}
-	var blob []byte
-	for {
-		chunk, err := bstream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Printf("Failed to receive bytes: %v\n", err)
-			return []byte{}, err
-		}
-		blob = append(blob, chunk.Data...)
-	}
-	return blob, nil
-}
-
-func ExtractFailuresFromTestLog(testLog string) (string, error) {
-	// First we need to find "json_report_created_event" event in the logs, which contains all inner errors.
-	// Example of report event in the logs:
-	// TIMESTAMP INFO[...] {"event_name":"json_report_created_event","body":{"success":[],"failure":[],"skipped":[]}}
-	reportIdx := strings.Index(testLog, "{\"event_name\":\"json_report_created_event\"")
-	if reportIdx == -1 {
-		err := errors.New("json_report_created_event was not found in the test log.")
-		log.Println(err)
-		return "", err
-	}
-	reportStart := reportIdx + strings.Index(testLog[reportIdx:], "{")
-	reportEnd := reportStart + strings.Index(testLog[reportStart:], "\n")
-	report := testLog[reportStart:reportEnd]
-	jsonMap := make(map[string]interface{})
-	errMsg := "json_report_created_event from log couldn't be processed correctly"
-	if err := json.Unmarshal([]byte(report), &jsonMap); err != nil {
-		log.Printf("Failed to unmarshal json bytes to map in json_report_created_event: %v\n", err)
-		return "", fmt.Errorf("%s: %v", errMsg, err)
-	}
-	jsonBytesBody, err := json.Marshal(jsonMap["body"])
-	if err != nil {
-		log.Printf("Failed to marshal map: %v\n", err)
-		return "", fmt.Errorf("%s: %v", errMsg, err)
-	}
-	jsonMap = make(map[string]interface{})
-	if err := json.Unmarshal([]byte(jsonBytesBody), &jsonMap); err != nil {
-		log.Printf("Failed to unmarshal json bytes in the \"body\" of json_report_created_event: %v\n", err)
-		return "", fmt.Errorf("%s: %v", errMsg, err)
-	}
-	jsonBytesFailure, err := json.Marshal(jsonMap["failure"])
-	if err != nil {
-		log.Printf("Failed to marshal map: %v\n", err)
-		return "", fmt.Errorf("%s: %v", errMsg, err)
-	}
-	return string(jsonBytesFailure), nil
-}
-
-func ExtractKibanaUrlFromTestLog(testLog string) (string, error) {
-	// System test log should contain this string.
-	message := "Replica logs will appear in Kibana: "
-	kibanaUrlIdx := strings.Index(testLog, message)
-	if kibanaUrlIdx == -1 {
-		return "", errors.New("Kibana url was not found in the test log.")
-	}
-	kibanaUrlStart := kibanaUrlIdx + len(message)
-	kibanaUrlEnd := kibanaUrlStart + strings.Index(testLog[kibanaUrlStart:], "\n")
-	kibanaUrl := testLog[kibanaUrlStart:kibanaUrlEnd]
-	return kibanaUrl, nil
-}
+		if
