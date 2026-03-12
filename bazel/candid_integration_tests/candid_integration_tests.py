@@ -14,8 +14,22 @@ if not os.path.isdir(workspace_dir):
 did_file_path = os.path.realpath(os.environ["DID_FILE_PATH"])
 backup_did_file_path = os.path.realpath(os.environ["BACKUP_DID_FILE_PATH"])
 
+# Validate that file paths are within workspace directory
+expected_base_dir = workspace_dir
+try:
+    assert os.path.commonpath([did_file_path, expected_base_dir]) == expected_base_dir
+    assert os.path.commonpath([backup_did_file_path, expected_base_dir]) == expected_base_dir
+except (ValueError, AssertionError):
+    sys.exit("File paths must be within WORKSPACE directory")
+
 
 def modify_file_contents(path, find, replacement):
+    # Validate that path is within workspace directory
+    try:
+        assert os.path.commonpath([path, expected_base_dir]) == expected_base_dir
+    except (ValueError, AssertionError):
+        raise ValueError(f"Path must be within WORKSPACE directory: {path}")
+    
     with open(path) as f:
         contents = f.read()
 
